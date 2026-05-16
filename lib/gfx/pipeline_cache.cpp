@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -593,7 +594,10 @@ void initialize_pipeline_cache() {
   g_pipelineFrameActive = false;
   g_pipelineThreadEnd = false;
 
-  if (webgpu::g_backendType == wgpu::BackendType::OpenGL || webgpu::g_backendType == wgpu::BackendType::OpenGLES ||
+  const char* syncPipelines = std::getenv("GCRR_AURORA_SYNC_PIPELINES");
+  const bool forceSynchronousPipelines = syncPipelines && syncPipelines[0] && syncPipelines[0] != '0';
+
+  if (forceSynchronousPipelines || webgpu::g_backendType == wgpu::BackendType::OpenGL || webgpu::g_backendType == wgpu::BackendType::OpenGLES ||
       webgpu::g_backendType == wgpu::BackendType::WebGPU) {
     g_hasPipelineThread = false;
   } else {
