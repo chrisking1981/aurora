@@ -21,6 +21,13 @@
 
 #include "tracy/Tracy.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
+
 namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
@@ -28,6 +35,101 @@ char g_gameName[4];
 
 namespace {
 Module Log("aurora");
+
+#ifdef AURORA_ENABLE_GX
+uint32_t capture_align_to(uint32_t value, uint32_t alignment) {
+  return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+uint32_t capture_crc32_update(uint32_t crc, const uint8_t* data, size_t size) {
+  crc = ~crc;
+  for (size_t i = 0; i < size; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+  }
+  return ~crc;
+}
+
+uint32_t capture_adler32(const std::vector<uint8_t>& data) {
+  uint32_t a = 1;
+  uint32_t b = 0;
+  for (uint8_t value : data) {
+    a = (a + value) % 65521u;
+    b = (b + a) % 65521u;
+  }
+  return (b << 16) | a;
+}
+
+void capture_append_u32(std::vector<uint8_t>& out, uint32_t value) {
+  out.push_back(uint8_t(value >> 24));
+  out.push_back(uint8_t(value >> 16));
+  out.push_back(uint8_t(value >> 8));
+  out.push_back(uint8_t(value));
+}
+
+void capture_append_chunk(std::vector<uint8_t>& out, const char type[4], const std::vector<uint8_t>& payload) {
+  capture_append_u32(out, uint32_t(payload.size()));
+  const size_t type_pos = out.size();
+  out.insert(out.end(), type, type + 4);
+  out.insert(out.end(), payload.begin(), payload.end());
+  capture_append_u32(out, capture_crc32_update(0, out.data() + type_pos, 4 + payload.size()));
+}
+
+bool capture_write_png_rgba(const std::filesystem::path& path, int w, int h, const std::vector<uint8_t>& rgba) {
+  if (w <= 0 || h <= 0 || rgba.size() < size_t(w) * size_t(h) * 4) {
+    return false;
+  }
+  std::filesystem::create_directories(path.parent_path());
+
+  std::vector<uint8_t> filtered;
+  filtered.reserve(size_t(h) * (size_t(w) * 4 + 1));
+  for (int y = h - 1; y >= 0; --y) {
+    filtered.push_back(0);
+    const uint8_t* row = rgba.data() + size_t(y) * size_t(w) * 4;
+    filtered.insert(filtered.end(), row, row + size_t(w) * 4);
+  }
+
+  std::vector<uint8_t> zlib;
+  zlib.push_back(0x78);
+  zlib.push_back(0x01);
+  size_t pos = 0;
+  while (pos < filtered.size()) {
+    const uint16_t block = uint16_t(std::min<size_t>(65535, filtered.size() - pos));
+    const bool final = pos + block == filtered.size();
+    zlib.push_back(final ? 1 : 0);
+    zlib.push_back(uint8_t(block));
+    zlib.push_back(uint8_t(block >> 8));
+    const uint16_t nlen = uint16_t(~block);
+    zlib.push_back(uint8_t(nlen));
+    zlib.push_back(uint8_t(nlen >> 8));
+    zlib.insert(zlib.end(), filtered.begin() + pos, filtered.begin() + pos + block);
+    pos += block;
+  }
+  capture_append_u32(zlib, capture_adler32(filtered));
+
+  std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+  std::vector<uint8_t> ihdr;
+  capture_append_u32(ihdr, uint32_t(w));
+  capture_append_u32(ihdr, uint32_t(h));
+  ihdr.push_back(8);
+  ihdr.push_back(6);
+  ihdr.push_back(0);
+  ihdr.push_back(0);
+  ihdr.push_back(0);
+  capture_append_chunk(png, "IHDR", ihdr);
+  capture_append_chunk(png, "IDAT", zlib);
+  capture_append_chunk(png, "IEND", {});
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    return false;
+  }
+  f.write(reinterpret_cast<const char*>(png.data()), std::streamsize(png.size()));
+  return f.good();
+}
+#endif
 
 #ifdef AURORA_ENABLE_GX
 // GPU
@@ -361,6 +463,85 @@ void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
+bool aurora_capture_present_png(const char* path) {
+#ifdef AURORA_ENABLE_GX
+  if (!path || !*path) {
+    return false;
+  }
+  const auto& source = aurora::webgpu::present_source();
+  const uint32_t width = source.size.width;
+  const uint32_t height = source.size.height;
+  if (width == 0 || height == 0 || !source.texture) {
+    return false;
+  }
+
+  const uint32_t bytesPerPixel = 4;
+  const uint32_t bytesPerRow = aurora::capture_align_to(width * bytesPerPixel, 256);
+  const uint64_t bufferSize = uint64_t(bytesPerRow) * height;
+  wgpu::BufferDescriptor bufferDesc{
+      .label = "Aurora present PNG capture",
+      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+      .size = bufferSize,
+  };
+  auto readback = aurora::webgpu::g_device.CreateBuffer(&bufferDesc);
+
+  const wgpu::TexelCopyTextureInfo src{
+      .texture = source.texture,
+      .mipLevel = 0,
+      .origin = {0, 0, 0},
+      .aspect = wgpu::TextureAspect::All,
+  };
+  const wgpu::TexelCopyBufferInfo dst{
+      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = height},
+      .buffer = readback,
+  };
+  const wgpu::Extent3D copySize{.width = width, .height = height, .depthOrArrayLayers = 1};
+  const wgpu::CommandEncoderDescriptor encDesc{.label = "Aurora present PNG capture encoder"};
+  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encDesc);
+  encoder.CopyTextureToBuffer(&src, &dst, &copySize);
+  const wgpu::CommandBufferDescriptor cmdDesc{.label = "Aurora present PNG capture command"};
+  auto cmd = encoder.Finish(&cmdDesc);
+  aurora::webgpu::g_queue.Submit(1, &cmd);
+
+  bool done = false;
+  bool ok = false;
+  readback.MapAsync(wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::AllowSpontaneous,
+                    [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                      ok = status == wgpu::MapAsyncStatus::Success;
+                      done = true;
+                    });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!done && std::chrono::steady_clock::now() < deadline) {
+    aurora::webgpu::g_instance.ProcessEvents();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!done || !ok) {
+    return false;
+  }
+
+  const auto* mapped = static_cast<const uint8_t*>(readback.GetConstMappedRange(0, bufferSize));
+  std::vector<uint8_t> rgba(size_t(width) * height * 4);
+  const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm ||
+                    source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* srcRow = mapped + size_t(y) * bytesPerRow;
+    uint8_t* dstRow = rgba.data() + size_t(y) * width * 4;
+    for (uint32_t x = 0; x < width; ++x) {
+      const uint8_t* p = srcRow + size_t(x) * 4;
+      uint8_t* q = dstRow + size_t(x) * 4;
+      q[0] = bgra ? p[2] : p[0];
+      q[1] = p[1];
+      q[2] = bgra ? p[0] : p[2];
+      q[3] = p[3];
+    }
+  }
+  readback.Unmap();
+  return aurora::capture_write_png_rgba(path, int(width), int(height), rgba);
+#else
+  (void)path;
+  return false;
+#endif
+}
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
   if (count != nullptr) {
