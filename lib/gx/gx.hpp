@@ -379,6 +379,9 @@ struct GXState {
     return regs;
   }();
   std::array<u32, 0x1A> xfRegCache;
+  gfx::ClipRect dispCopySrc{0, 0, 640, 480};
+  u16 dispCopyDstWidth = 640;
+  u16 dispCopyDstHeight = 480;
 
   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
 };

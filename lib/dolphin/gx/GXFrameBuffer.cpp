@@ -6,12 +6,15 @@
 #include "../../window.hpp"
 #include "../../gfx/clear.hpp"
 #include "../../webgpu/gpu.hpp"
+#include "../../gx/fifo.hpp"
 #include "../vi/vi_internal.hpp"
 
 #include <algorithm>
 #include <cmath>
 
 namespace {
+aurora::gfx::TextureHandle g_xfbCopyTexture;
+
 aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
     return {logicalWidth, logicalHeight};
@@ -101,11 +104,14 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
   rmout->xfbHeight = size.fb_height;
 }
 
-void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {}
+void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) { g_gxState.dispCopySrc = {left, top, wd, ht}; }
 
 void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) { g_gxState.texCopySrc = {left, top, wd, ht}; }
 
-void GXSetDispCopyDst(u16 wd, u16 ht) {}
+void GXSetDispCopyDst(u16 wd, u16 ht) {
+  g_gxState.dispCopyDstWidth = wd;
+  g_gxState.dispCopyDstHeight = ht;
+}
 
 void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
   g_gxState.texCopyFmt = fmt;
@@ -145,7 +151,51 @@ void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[
 
 void GXSetDispCopyGamma(GXGamma gamma) {}
 
-void GXCopyDisp(void* dest, GXBool clear) {}
+void GXCopyDisp(void* dest, GXBool clear) {
+  (void)dest;
+  aurora::gx::fifo::drain();
+  const auto rect = aurora::gx::map_logical_scissor(g_gxState.dispCopySrc);
+  const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.dispCopyDstWidth, g_gxState.dispCopyDstHeight);
+  if (!g_xfbCopyTexture || g_xfbCopyTexture->size.width != dstWidth || g_xfbCopyTexture->size.height != dstHeight) {
+    g_xfbCopyTexture = aurora::gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8, "GXCopyDisp XFB Texture");
+  }
+
+  const auto clearColor = clear && g_gxState.colorUpdate;
+  const auto clearAlpha = clear && g_gxState.alphaUpdate;
+  const auto clearDepth = clear && g_gxState.depthUpdate;
+  aurora::gfx::resolve_pass(g_xfbCopyTexture, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
+                            aurora::gx::clear_depth_value(), GX_TF_RGBA8);
+  if (clearColor || clearAlpha || clearDepth) {
+    aurora::gfx::push_draw_command(aurora::gfx::clear::DrawData{
+        .pipeline = aurora::gfx::pipeline_ref(aurora::gfx::clear::PipelineConfig{
+            .clearColor = clearColor,
+            .clearAlpha = clearAlpha,
+            .clearDepth = clearDepth,
+        }),
+        .color =
+            wgpu::Color{
+                .r = g_gxState.clearColor.x(),
+                .g = g_gxState.clearColor.y(),
+                .b = g_gxState.clearColor.z(),
+                .a = g_gxState.clearColor.w(),
+            },
+        .depth = aurora::gx::clear_depth_value(),
+    });
+  }
+
+  const aurora::webgpu::TextureWithSampler xfbSource{
+      .texture = g_xfbCopyTexture->texture,
+      .view = g_xfbCopyTexture->sampleTextureView,
+      .size = g_xfbCopyTexture->size,
+      .format = g_xfbCopyTexture->format,
+      .sampler = aurora::webgpu::present_source().sampler,
+  };
+  aurora::webgpu::g_CopyBindGroup = aurora::webgpu::create_copy_bind_group(xfbSource);
+}
+
+const aurora::gfx::TextureRef* AuroraGetLastCopyDispTextureForReadback(void) {
+  return g_xfbCopyTexture.get();
+}
 
 void GXCopyTex(void* dest, GXBool clear) {
   const auto rect = aurora::gx::map_logical_scissor(g_gxState.texCopySrc);

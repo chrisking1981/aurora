@@ -325,6 +325,7 @@ void end_frame() noexcept {
         Log.warn("Surface present failed: {}", static_cast<int>(presentStatus));
         webgpu::release_surface();
       }
+      webgpu::g_CopyBindGroup = webgpu::create_copy_bind_group(webgpu::present_source());
     } else if (g_surface) {
       webgpu::release_surface();
     }
