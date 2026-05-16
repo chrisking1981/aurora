@@ -2,6 +2,7 @@
 
 #ifdef AURORA_ENABLE_GX
 #include "gfx/common.hpp"
+#include "gfx/texture.hpp"
 #include "gx/fifo.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
@@ -27,6 +28,10 @@
 #include <fstream>
 #include <thread>
 #include <vector>
+
+#ifdef AURORA_ENABLE_GX
+extern "C" const aurora::gfx::TextureRef* AuroraGetLastCopyDispTextureForReadback(void);
+#endif
 
 namespace aurora {
 AuroraConfig g_config;
@@ -128,6 +133,75 @@ bool capture_write_png_rgba(const std::filesystem::path& path, int w, int h, con
   }
   f.write(reinterpret_cast<const char*>(png.data()), std::streamsize(png.size()));
   return f.good();
+}
+
+bool capture_texture_png(const char* path, const wgpu::Texture& texture, wgpu::TextureFormat format,
+                         const wgpu::Extent3D& size) {
+  if (!path || !*path || size.width == 0 || size.height == 0 || !texture) {
+    return false;
+  }
+
+  const uint32_t bytesPerPixel = 4;
+  const uint32_t bytesPerRow = capture_align_to(size.width * bytesPerPixel, 256);
+  const uint64_t bufferSize = uint64_t(bytesPerRow) * size.height;
+  wgpu::BufferDescriptor bufferDesc{
+      .label = "Aurora PNG texture capture",
+      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+      .size = bufferSize,
+  };
+  auto readback = aurora::webgpu::g_device.CreateBuffer(&bufferDesc);
+
+  const wgpu::TexelCopyTextureInfo src{
+      .texture = texture,
+      .mipLevel = 0,
+      .origin = {0, 0, 0},
+      .aspect = wgpu::TextureAspect::All,
+  };
+  const wgpu::TexelCopyBufferInfo dst{
+      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = size.height},
+      .buffer = readback,
+  };
+  const wgpu::Extent3D copySize{.width = size.width, .height = size.height, .depthOrArrayLayers = 1};
+  const wgpu::CommandEncoderDescriptor encDesc{.label = "Aurora PNG texture capture encoder"};
+  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encDesc);
+  encoder.CopyTextureToBuffer(&src, &dst, &copySize);
+  const wgpu::CommandBufferDescriptor cmdDesc{.label = "Aurora PNG texture capture command"};
+  auto cmd = encoder.Finish(&cmdDesc);
+  aurora::webgpu::g_queue.Submit(1, &cmd);
+
+  bool done = false;
+  bool ok = false;
+  readback.MapAsync(wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::AllowSpontaneous,
+                    [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
+                      ok = status == wgpu::MapAsyncStatus::Success;
+                      done = true;
+                    });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!done && std::chrono::steady_clock::now() < deadline) {
+    aurora::webgpu::g_instance.ProcessEvents();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!done || !ok) {
+    return false;
+  }
+
+  const auto* mapped = static_cast<const uint8_t*>(readback.GetConstMappedRange(0, bufferSize));
+  std::vector<uint8_t> rgba(size_t(size.width) * size.height * 4);
+  const bool bgra = format == wgpu::TextureFormat::BGRA8Unorm || format == wgpu::TextureFormat::BGRA8UnormSrgb;
+  for (uint32_t y = 0; y < size.height; ++y) {
+    const uint8_t* srcRow = mapped + size_t(y) * bytesPerRow;
+    uint8_t* dstRow = rgba.data() + size_t(y) * size.width * 4;
+    for (uint32_t x = 0; x < size.width; ++x) {
+      const uint8_t* p = srcRow + size_t(x) * 4;
+      uint8_t* q = dstRow + size_t(x) * 4;
+      q[0] = bgra ? p[2] : p[0];
+      q[1] = p[1];
+      q[2] = bgra ? p[0] : p[2];
+      q[3] = p[3];
+    }
+  }
+  readback.Unmap();
+  return capture_write_png_rgba(path, int(size.width), int(size.height), rgba);
 }
 #endif
 
@@ -465,78 +539,26 @@ bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }
 bool aurora_capture_present_png(const char* path) {
 #ifdef AURORA_ENABLE_GX
-  if (!path || !*path) {
-    return false;
-  }
   const auto& source = aurora::webgpu::present_source();
-  const uint32_t width = source.size.width;
-  const uint32_t height = source.size.height;
-  if (width == 0 || height == 0 || !source.texture) {
-    return false;
-  }
-
-  const uint32_t bytesPerPixel = 4;
-  const uint32_t bytesPerRow = aurora::capture_align_to(width * bytesPerPixel, 256);
-  const uint64_t bufferSize = uint64_t(bytesPerRow) * height;
-  wgpu::BufferDescriptor bufferDesc{
-      .label = "Aurora present PNG capture",
-      .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-      .size = bufferSize,
-  };
-  auto readback = aurora::webgpu::g_device.CreateBuffer(&bufferDesc);
-
-  const wgpu::TexelCopyTextureInfo src{
-      .texture = source.texture,
-      .mipLevel = 0,
-      .origin = {0, 0, 0},
-      .aspect = wgpu::TextureAspect::All,
-  };
-  const wgpu::TexelCopyBufferInfo dst{
-      .layout = {.offset = 0, .bytesPerRow = bytesPerRow, .rowsPerImage = height},
-      .buffer = readback,
-  };
-  const wgpu::Extent3D copySize{.width = width, .height = height, .depthOrArrayLayers = 1};
-  const wgpu::CommandEncoderDescriptor encDesc{.label = "Aurora present PNG capture encoder"};
-  auto encoder = aurora::webgpu::g_device.CreateCommandEncoder(&encDesc);
-  encoder.CopyTextureToBuffer(&src, &dst, &copySize);
-  const wgpu::CommandBufferDescriptor cmdDesc{.label = "Aurora present PNG capture command"};
-  auto cmd = encoder.Finish(&cmdDesc);
-  aurora::webgpu::g_queue.Submit(1, &cmd);
-
-  bool done = false;
-  bool ok = false;
-  readback.MapAsync(wgpu::MapMode::Read, 0, bufferSize, wgpu::CallbackMode::AllowSpontaneous,
-                    [&](wgpu::MapAsyncStatus status, wgpu::StringView) {
-                      ok = status == wgpu::MapAsyncStatus::Success;
-                      done = true;
-                    });
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!done && std::chrono::steady_clock::now() < deadline) {
-    aurora::webgpu::g_instance.ProcessEvents();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  if (!done || !ok) {
-    return false;
-  }
-
-  const auto* mapped = static_cast<const uint8_t*>(readback.GetConstMappedRange(0, bufferSize));
-  std::vector<uint8_t> rgba(size_t(width) * height * 4);
-  const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm ||
-                    source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
-  for (uint32_t y = 0; y < height; ++y) {
-    const uint8_t* srcRow = mapped + size_t(y) * bytesPerRow;
-    uint8_t* dstRow = rgba.data() + size_t(y) * width * 4;
-    for (uint32_t x = 0; x < width; ++x) {
-      const uint8_t* p = srcRow + size_t(x) * 4;
-      uint8_t* q = dstRow + size_t(x) * 4;
-      q[0] = bgra ? p[2] : p[0];
-      q[1] = p[1];
-      q[2] = bgra ? p[0] : p[2];
-      q[3] = p[3];
-    }
-  }
-  readback.Unmap();
-  return aurora::capture_write_png_rgba(path, int(width), int(height), rgba);
+  return aurora::capture_texture_png(path, source.texture, source.format, source.size);
+#else
+  (void)path;
+  return false;
+#endif
+}
+bool aurora_capture_efb_png(const char* path) {
+#ifdef AURORA_ENABLE_GX
+  return aurora::capture_texture_png(path, aurora::webgpu::g_frameBuffer.texture, aurora::webgpu::g_frameBuffer.format,
+                                     aurora::webgpu::g_frameBuffer.size);
+#else
+  (void)path;
+  return false;
+#endif
+}
+bool aurora_capture_xfb_png(const char* path) {
+#ifdef AURORA_ENABLE_GX
+  const auto* xfb = AuroraGetLastCopyDispTextureForReadback();
+  return xfb && aurora::capture_texture_png(path, xfb->texture, xfb->format, xfb->size);
 #else
   (void)path;
   return false;
