@@ -149,6 +149,7 @@ struct RenderPass {
 static std::vector<RenderPass> g_renderPasses;
 static u32 g_currentRenderPass = UINT32_MAX;
 static bool g_inOffscreen = false;
+static bool g_efbInitialized = false;
 static std::optional<RenderPass> g_suspendedEfbPass;
 static Viewport g_suspendedEfbViewport;
 static ClipRect g_suspendedEfbScissor;
@@ -677,6 +678,8 @@ bool begin_frame() {
   set_efb_targets(g_renderPasses[0]);
   g_renderPasses[0].clearColorValue = gx::g_gxState.clearColor;
   g_renderPasses[0].clearDepthValue = gx::clear_depth_value();
+  g_renderPasses[0].clearColor = !g_efbInitialized;
+  g_renderPasses[0].clearDepth = !g_efbInitialized;
   g_currentRenderPass = 0;
   // Refresh render viewport/scissor from logical in case FB size changed
   g_cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
@@ -734,6 +737,7 @@ void end_frame(const wgpu::CommandEncoder& cmd) {
     array.cachedRange = {};
   }
   end_pipeline_frame();
+  g_efbInitialized = true;
   ++g_frameIndex;
 }
 
