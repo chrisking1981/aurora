@@ -11,9 +11,20 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 aurora::gfx::TextureHandle g_xfbCopyTexture;
+
+bool copy_trace_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* env = std::getenv("GCRR_AURORA_COPY_TRACE");
+    enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
+  }
+  return enabled != 0;
+}
 
 aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
@@ -163,6 +174,37 @@ void GXCopyDisp(void* dest, GXBool clear) {
   const auto clearColor = clear && g_gxState.colorUpdate;
   const auto clearAlpha = clear && g_gxState.alphaUpdate;
   const auto clearDepth = clear && g_gxState.depthUpdate;
+  if (copy_trace_enabled()) {
+    std::fprintf(stderr,
+                 "[aurora-copydisp] dest=%p clear=%u src=(%u,%u %ux%u) rect=(%u,%u %ux%u) "
+                 "dst=%ux%u clear_flags=%u/%u/%u updates=%u/%u/%u "
+                 "clear_rgba=%.3f,%.3f,%.3f,%.3f depth=%.6f xfb=%ux%u\n",
+                 dest,
+                 static_cast<unsigned>(clear),
+                 static_cast<unsigned>(g_gxState.dispCopySrc.x),
+                 static_cast<unsigned>(g_gxState.dispCopySrc.y),
+                 static_cast<unsigned>(g_gxState.dispCopySrc.width),
+                 static_cast<unsigned>(g_gxState.dispCopySrc.height),
+                 static_cast<unsigned>(rect.x),
+                 static_cast<unsigned>(rect.y),
+                 static_cast<unsigned>(rect.width),
+                 static_cast<unsigned>(rect.height),
+                 static_cast<unsigned>(dstWidth),
+                 static_cast<unsigned>(dstHeight),
+                 clearColor ? 1u : 0u,
+                 clearAlpha ? 1u : 0u,
+                 clearDepth ? 1u : 0u,
+                 g_gxState.colorUpdate ? 1u : 0u,
+                 g_gxState.alphaUpdate ? 1u : 0u,
+                 g_gxState.depthUpdate ? 1u : 0u,
+                 static_cast<double>(g_gxState.clearColor.x()),
+                 static_cast<double>(g_gxState.clearColor.y()),
+                 static_cast<double>(g_gxState.clearColor.z()),
+                 static_cast<double>(g_gxState.clearColor.w()),
+                 static_cast<double>(aurora::gx::clear_depth_value()),
+                 static_cast<unsigned>(g_xfbCopyTexture->size.width),
+                 static_cast<unsigned>(g_xfbCopyTexture->size.height));
+  }
   aurora::gfx::resolve_pass(g_xfbCopyTexture, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
                             aurora::gx::clear_depth_value(), GX_TF_RGBA8);
   if (clearColor || clearAlpha || clearDepth) {
